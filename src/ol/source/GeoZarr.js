@@ -2,12 +2,11 @@
  * @module ol/source/GeoZarr
  */
 
-import {FetchStore, get, open, slice} from 'zarrita';
+import {FetchStore, get, open, slice, withRangeBatching} from 'zarrita';
 import {getCenter} from '../extent.js';
 import {get as getProjection, toUserCoordinate, toUserExtent} from '../proj.js';
 import {toSize} from '../size.js';
 import WMTSTileGrid from '../tilegrid/WMTS.js';
-import BatchedFetchStore from '@zarrita/storage/batched-fetch';
 import DataTileSource from './DataTile.js';
 import {parseTileMatrixSet} from './ogcTileUtil.js';
 
@@ -23,8 +22,7 @@ const REQUIRED_ZARR_CONVENTIONS = [
 
 /**
  * @typedef {Object} Options
- * @property {string} url The Zarr URL.
- * @property {string} group The group with arrays to render.
+ * @property {string} url The Zarr URL including the multiscales group path (e.g. `'https://example.com/store.zarr/measurements/reflectance'`).
  * @property {Array<string>} bands The band names to render.
  * @property {import("../proj.js").ProjectionLike} [projection] Source projection.  If not provided, the GeoZarr metadata
  * will be read for projection information.
@@ -34,6 +32,12 @@ const REQUIRED_ZARR_CONVENTIONS = [
  * @property {ResampleMethod} [resample='nearest'] Resamplilng method if bands are not available for all multi-scale levels.
  */
 
+/**
+ * Source that supports GeoZarr stores with metadata for the following conventions:
+ * - Zarr multiscales convention (https://github.com/zarr-conventions/multiscales)
+ * - Geospatial projection convention (https://github.com/zarr-conventions/geo-proj)
+ * - Spatial convention (https://github.com/zarr-conventions/spatial)
+ */
 export default class GeoZarr extends DataTileSource {
   /**
    * @param {Options} options The options.
@@ -54,12 +58,6 @@ export default class GeoZarr extends DataTileSource {
     this.url_ = options.url;
 
     /**
-     * @type {string}
-     * @private
-     */
-    this.group_ = options.group;
-
-    /**
      * @type {Error|null}
      */
     this.error_ = null;
@@ -68,7 +66,7 @@ export default class GeoZarr extends DataTileSource {
      * @type {import('zarrita').Group<any>}
      * @private
      */
-    this.root_ = null;
+    this.group_ = null;
 
     /**
      * @type {any|null}
@@ -80,8 +78,8 @@ export default class GeoZarr extends DataTileSource {
      * Cache of opened zarrita arrays keyed by path. Caching the Promise
      * (not the resolved value) deduplicates concurrent opens for the same
      * array path across tiles at the same zoom level.
-     * @type {Map<string, Promise<import('zarrita').Array<import('zarrita').DataType, any>>>}
      * @private
+     * @type {Map<string, Promise<import('zarrita').Array<import('zarrita').DataType, any>>>}
      */
     this.arrayCache_ = new Map();
 
@@ -110,7 +108,8 @@ export default class GeoZarr extends DataTileSource {
     this.resampleMethod_ = options.resample || 'linear';
 
     /**
-     * @type {number} Number of bands.
+     * Number of bands.
+     * @type {number}
      */
     this.bandCount = this.bands_.length;
 
@@ -133,25 +132,50 @@ export default class GeoZarr extends DataTileSource {
   }
 
   async configure_() {
-    const store = new BatchedFetchStore(new FetchStore(this.url_));
+    // Batch concurrent getRange() calls from zarrita: merges adjacent byte
+    // ranges (sharded chunk reads) and caches recent ranges. mergeOptions
+    // preserves per-caller AbortSignals by combining them with AbortSignal.any,
+    // so tile cancellation does not kill unrelated reads sharing a batch.
+    const store = withRangeBatching(new FetchStore(this.url_), {
+      mergeOptions: (batch) => {
+        const signals = batch
+          .map((o) => o?.signal)
+          .filter((s) => s !== undefined);
+        if (signals.length === 0) {
+          return batch[0];
+        }
+        return {...batch[0], signal: AbortSignal.any(signals)};
+      },
+    });
 
-    this.root_ = await open(store, {kind: 'group'});
-
-    try {
-      this.consolidatedMetadata_ = JSON.parse(
-        new TextDecoder().decode(
-          await store.get(this.root_.resolve('zarr.json').path),
-        ),
-      ).consolidated_metadata.metadata;
-    } catch {
-      // empty catch block
+    // Fetch group zarr.json once for both opening the group and extracting
+    // consolidated metadata. Without this, open() and the manual metadata
+    // read would each make a separate HTTP request for the same file.
+    const groupBytes = await store.get('/zarr.json');
+    if (groupBytes) {
+      try {
+        this.consolidatedMetadata_ = JSON.parse(
+          new TextDecoder().decode(groupBytes),
+        ).consolidated_metadata.metadata;
+      } catch {
+        // no consolidated metadata
+      }
     }
 
-    const group = await open(this.root_.resolve(this.group_), {kind: 'group'});
+    // Wrap the store so that child metadata (groups, arrays) is served from
+    // the consolidated metadata instead of making per-child HTTP requests.
+    const cachedStore = this.consolidatedMetadata_
+      ? createCachedStore(store, groupBytes, this.consolidatedMetadata_)
+      : store;
+
+    this.group_ = await open(cachedStore, {kind: 'group'});
 
     const attributes =
-      /** @type {LegacyDatasetAttributes | DatasetAttributes} */ (group.attrs);
+      /** @type {LegacyDatasetAttributes | DatasetAttributes} */ (
+        this.group_.attrs
+      );
 
+    let hasTileSizes = false;
     if (
       'zarr_conventions' in attributes &&
       Array.isArray(attributes.zarr_conventions) &&
@@ -160,25 +184,21 @@ export default class GeoZarr extends DataTileSource {
       ) &&
       'layout' in attributes.multiscales
     ) {
-      const {tileGrid, projection, bandsByLevel, fillValue} =
+      const {tileGrid, projection, bandsByLevel, fillValue, tileSizes} =
         getTileGridInfoFromAttributes(
           /** @type {DatasetAttributes} */ (attributes),
           this.consolidatedMetadata_,
-          this.group_,
           this.bands_,
         );
       this.bandsByLevel_ = bandsByLevel;
       this.tileGrid = tileGrid;
       this.projection = projection;
       this.fillValue_ = fillValue;
-      if (this.fillValue_ !== null && this.fillValue_ !== undefined) {
-        this.bandCount = this.bands_.length + 1;
-        this.nodataBandIndex = this.bandCount;
-      }
+      hasTileSizes = !!tileSizes;
     }
-    if ('tile_matrix_set' in attributes.multiscales) {
+    if (!hasTileSizes && 'tile_matrix_set' in attributes.multiscales) {
       // If available, use tile_matrix_set (legacy attributes) to get a tile grid, because it
-      // provides a better mapping of tiles to zarr chunks.
+      // should provide a better mapping of tiles to zarr chunks.
       const {tileGrid, projection} = getTileGridInfoFromLegacyAttributes(
         /** @type {LegacyDatasetAttributes} */ (attributes),
       );
@@ -187,6 +207,10 @@ export default class GeoZarr extends DataTileSource {
         // If there were no required zarr conventions, we don't have a projection yet
         this.projection = projection;
       }
+    }
+    if (this.fillValue_ !== null && this.fillValue_ !== undefined) {
+      this.bandCount = this.bands_.length + 1;
+      this.nodataBandIndex = this.bandCount;
     }
     if (!this.tileGrid) {
       throw new Error('Could not determine tile grid');
@@ -260,7 +284,7 @@ export default class GeoZarr extends DataTileSource {
       const maxRow = Math.round((origin[1] - tileExtent[1]) / bandResolution);
 
       bandInfos.push({
-        path: `${this.group_}/${bandMatrixId}/${band}`,
+        path: `${bandMatrixId}/${band}`,
         minRow,
         maxRow,
         minCol,
@@ -276,7 +300,7 @@ export default class GeoZarr extends DataTileSource {
         if (!this.arrayCache_.has(path)) {
           this.arrayCache_.set(
             path,
-            open(this.root_.resolve(path), {kind: 'array'}).catch((err) => {
+            open(this.group_.resolve(path), {kind: 'array'}).catch((err) => {
               this.arrayCache_.delete(path);
               throw err;
             }),
@@ -312,6 +336,32 @@ export default class GeoZarr extends DataTileSource {
 }
 
 /**
+ * Create a store wrapper that serves Zarr v3 metadata from consolidated
+ * metadata, avoiding per-child HTTP requests.
+ * @param {import('zarrita').FetchStore} store The underlying store.
+ * @param {Uint8Array} groupBytes The already-fetched group zarr.json bytes.
+ * @param {Object} consolidatedMetadata The parsed consolidated_metadata.metadata entries.
+ * @return {Object} A store-compatible object.
+ */
+function createCachedStore(store, groupBytes, consolidatedMetadata) {
+  const cache = new Map();
+  cache.set('/zarr.json', groupBytes);
+  const encoder = new TextEncoder();
+  for (const [key, value] of Object.entries(consolidatedMetadata)) {
+    cache.set(`/${key}/zarr.json`, encoder.encode(JSON.stringify(value)));
+  }
+  return {
+    async get(key, opts) {
+      if (cache.has(key)) {
+        return cache.get(key);
+      }
+      return store.get(key, opts);
+    },
+    getRange: store.getRange?.bind(store),
+  };
+}
+
+/**
  * @typedef {Object} DatasetAttributes
  * @property {Multiscales} multiscales The multiscales attribute.
  * @property {Array<{uuid: string}>} zarr_conventions The zarr conventions attribute.
@@ -339,63 +389,162 @@ export default class GeoZarr extends DataTileSource {
  * @property {import("../proj/Projection.js").default} projection The projection.
  * @property {Object<string, Array<string>>} [bandsByLevel] Available bands by level.
  * @property {number} [fillValue] The fill value.
+ * @property {Array<import("../size.js").Size>|undefined} [tileSizes] The tile sizes for each level, if available.
  */
+
+/**
+ * Maximum tile size for rendering.
+ * @type {number}
+ */
+const MAX_TILE_SIZE = 512;
+
+/**
+ * Minimum tile size when sharding is used.
+ * @type {number}
+ */
+const MIN_TILE_SIZE = 64;
+
+/**
+ * @typedef {Object} ShardInfo
+ * @property {Array<number>} shardShape The shard (outer chunk) shape [rows, cols].
+ * @property {Array<number>} innerChunkShape The inner chunk shape [rows, cols].
+ */
+
+/**
+ * FIXME Remove this when GeoZarr datasets provide correct TileMatrixSet info or similar.
+ *
+ * Get the shard and inner chunk shapes from the Zarr v3 array metadata.
+ * Only returns info when a `sharding_indexed` codec is present, meaning
+ * `chunk_grid.configuration.chunk_shape` represents the shard (outer chunk) size.
+ * @param {Object} arrayMeta The Zarr v3 array metadata from consolidated metadata.
+ * @return {ShardInfo|undefined} The shard info, or undefined.
+ */
+function getShardInfo(arrayMeta) {
+  const chunkGrid = arrayMeta['chunk_grid'];
+  if (!chunkGrid || chunkGrid['name'] !== 'regular') {
+    return undefined;
+  }
+  const codecs = arrayMeta['codecs'];
+  if (!Array.isArray(codecs)) {
+    return undefined;
+  }
+  const shardingCodec = codecs.find((c) => c['name'] === 'sharding_indexed');
+  if (!shardingCodec) {
+    return undefined;
+  }
+  return {
+    shardShape: chunkGrid['configuration']['chunk_shape'],
+    innerChunkShape: shardingCodec['configuration']['chunk_shape'],
+  };
+}
+
+/**
+ * FIXME Remove this when GeoZarr datasets provide correct TileMatrixSet info or similar.
+ *
+ * Compute a tile size that is a multiple of the inner chunk size, evenly divides
+ * the shard size, is at most MAX_TILE_SIZE, and is at least MIN_TILE_SIZE.
+ * Aligning with inner chunk boundaries avoids fetching the same inner chunk
+ * data for adjacent tiles.
+ * @param {number} shardSize The shard size in pixels along one dimension.
+ * @param {number} innerChunkSize The inner chunk size in pixels along one dimension.
+ * @return {number} The tile size.
+ */
+function getTileSizeForShard(shardSize, innerChunkSize) {
+  // Find the largest multiple of innerChunkSize that divides shardSize
+  // and is within [MIN_TILE_SIZE, MAX_TILE_SIZE].
+  const maxChunks = Math.floor(MAX_TILE_SIZE / innerChunkSize);
+  for (let n = maxChunks; n >= 1; --n) {
+    const candidate = n * innerChunkSize;
+    if (candidate >= MIN_TILE_SIZE && shardSize % candidate === 0) {
+      return candidate;
+    }
+  }
+  // No ideal size found. Use shard size itself when it fits, otherwise
+  // use the largest chunk-aligned size that fits within MAX_TILE_SIZE.
+  if (shardSize <= MAX_TILE_SIZE && shardSize >= MIN_TILE_SIZE) {
+    return shardSize;
+  }
+  if (shardSize < MIN_TILE_SIZE) {
+    return MIN_TILE_SIZE;
+  }
+  return Math.max(maxChunks * innerChunkSize, MIN_TILE_SIZE);
+}
 
 /**
  * @param {DatasetAttributes} attributes The dataset attributes.
  * @param {any} consolidatedMetadata The consolidated metadata.
- * @param {string} wantedGroup The path to the wanted group.
  * @param {Array<string>} wantedBands The wanted bands.
  * @return {TileGridInfo} The tile grid info.
  */
 function getTileGridInfoFromAttributes(
   attributes,
   consolidatedMetadata,
-  wantedGroup,
   wantedBands,
 ) {
   const multiscales = attributes.multiscales;
   const extent = attributes['spatial:bbox'];
   const projection = getProjection(attributes['proj:code']);
-  /** @type {Array<{matrixId: string, resolution: number, origin: import("ol/coordinate").Coordinate}>} */
+  const extentWidth = extent[2] - extent[0];
+  const origin = [extent[0], extent[3]];
+  /** @type {Array<{matrixId: string, resolution: number, origin: import("../coordinate.js").Coordinate, tileSize: import("../size.js").Size|undefined}>} */
   const groupInfo = [];
   const bandsByLevel = consolidatedMetadata ? {} : null;
   let fillValue;
   for (const groupMetadata of multiscales.layout) {
-    //TODO Handle the complete transform (rotation and different x/y resolutions)
-    const transform = groupMetadata['spatial:transform'];
-    const resolution = transform[0];
-    const origin = [transform[2], transform[5]];
     const matrixId = groupMetadata.asset;
-    groupInfo.push({
-      matrixId,
-      resolution,
-      origin,
-    });
+    const resolution = extentWidth / groupMetadata['spatial:shape'][1];
+    /** @type {import("../size.js").Size|undefined} */
+    let tileSize;
     if (consolidatedMetadata) {
       const availableBands = [];
       for (const band of wantedBands) {
-        const bandArray =
-          consolidatedMetadata[`${wantedGroup}/${matrixId}/${band}`];
+        const bandArray = consolidatedMetadata[`${matrixId}/${band}`];
         if (bandArray) {
           availableBands.push(band);
           if (fillValue === undefined) {
             fillValue = Number(bandArray['fill_value']);
           }
+          //FIXME Remove this when GeoZarr datasets provide correct TileMatrixSet info or similar
+          if (!tileSize) {
+            const shardInfo = getShardInfo(bandArray);
+            if (shardInfo) {
+              tileSize = [
+                getTileSizeForShard(
+                  shardInfo.shardShape[1],
+                  shardInfo.innerChunkShape[1],
+                ),
+                getTileSizeForShard(
+                  shardInfo.shardShape[0],
+                  shardInfo.innerChunkShape[0],
+                ),
+              ];
+            }
+          }
         }
       }
       bandsByLevel[matrixId] = availableBands;
     }
+    groupInfo.push({
+      matrixId,
+      resolution,
+      origin,
+      tileSize,
+    });
   }
   groupInfo.sort((a, b) => b.resolution - a.resolution);
+
+  const tileSizes = groupInfo.map((g) => g.tileSize);
+  const hasTileSizes = tileSizes.some((s) => s !== undefined);
+
   const tileGrid = new WMTSTileGrid({
     extent: extent,
     origins: groupInfo.map((g) => g.origin),
     resolutions: groupInfo.map((g) => g.resolution),
     matrixIds: groupInfo.map((g) => g.matrixId),
+    ...(hasTileSizes ? {tileSizes: tileSizes.map((s) => s || [256, 256])} : {}),
   });
 
-  return {tileGrid, projection, bandsByLevel, fillValue};
+  return {tileGrid, projection, bandsByLevel, fillValue, tileSizes};
 }
 
 /**

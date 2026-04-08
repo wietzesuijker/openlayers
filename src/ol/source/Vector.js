@@ -7,9 +7,9 @@ import CollectionEventType from '../CollectionEventType.js';
 import ObjectEventType from '../ObjectEventType.js';
 import {extend} from '../array.js';
 import {assert} from '../asserts.js';
+import {listen, unlistenByKey} from '../events.js';
 import Event from '../events/Event.js';
 import EventType from '../events/EventType.js';
-import {listen, unlistenByKey} from '../events.js';
 import {containsExtent, equals, wrapAndSliceX} from '../extent.js';
 import {xhr} from '../featureloader.js';
 import {TRUE, VOID} from '../functions.js';
@@ -69,11 +69,11 @@ export class VectorSourceEvent extends Event {
 /***
  * @template Return
  * @template {import("../Feature.js").FeatureLike} [FeatureType=import("../Feature.js").default]
- * @typedef {import("../Observable").OnSignature<import("../Observable").EventTypes, import("../events/Event.js").default, Return> &
- *   import("../Observable").OnSignature<import("../ObjectEventType").Types, import("../Object").ObjectEvent, Return> &
- *   import("../Observable").OnSignature<import("./VectorEventType").VectorSourceEventTypes, VectorSourceEvent<FeatureType>, Return> &
- *   import("../Observable").CombinedOnSignature<import("../Observable").EventTypes|import("../ObjectEventType").Types|
- *     import("./VectorEventType").VectorSourceEventTypes, Return>} VectorSourceOnSignature
+ * @typedef {import("../Observable.js").OnSignature<import("../Observable.js").EventTypes, import("../events/Event.js").default, Return> &
+ *   import("../Observable.js").OnSignature<import("../ObjectEventType.js").Types, import("../Object.js").ObjectEvent, Return> &
+ *   import("../Observable.js").OnSignature<import("./VectorEventType.js").VectorSourceEventTypes, VectorSourceEvent<FeatureType>, Return> &
+ *   import("../Observable.js").CombinedOnSignature<import("../Observable.js").EventTypes|import("../ObjectEventType.js").Types|
+ *     import("./VectorEventType.js").VectorSourceEventTypes, Return>} VectorSourceOnSignature
  */
 
 /**
@@ -195,12 +195,12 @@ class VectorSource extends Source {
     });
 
     /***
-     * @type {VectorSourceOnSignature<import("../events").EventsKey, FeatureType>}
+     * @type {VectorSourceOnSignature<import("../events.js").EventsKey, FeatureType>}
      */
     this.on;
 
     /***
-     * @type {VectorSourceOnSignature<import("../events").EventsKey, FeatureType>}
+     * @type {VectorSourceOnSignature<import("../events.js").EventsKey, FeatureType>}
      */
     this.once;
 

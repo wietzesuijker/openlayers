@@ -84,7 +84,7 @@ class CanvasVectorTileLayerRenderer extends CanvasTileLayerRenderer {
 
     /**
      * @private
-     * @type {import("../../transform").Transform}
+     * @type {import("../../transform.js").Transform}
      */
     this.renderedPixelToCoordinateTransform_ = null;
 
@@ -371,8 +371,9 @@ class CanvasVectorTileLayerRenderer extends CanvasTileLayerRenderer {
       frameState.viewState.projection,
     );
 
+    const renderBuffer = layer.getRenderBuffer();
     const hitExtent = boundingExtent([coordinate]);
-    buffer(hitExtent, resolution * hitTolerance, hitExtent);
+    buffer(hitExtent, resolution * (renderBuffer + hitTolerance), hitExtent);
 
     /** @type {!Object<string, import("../Map.js").HitMatch<T>|true>} */
     const features = {};
@@ -425,7 +426,7 @@ class CanvasVectorTileLayerRenderer extends CanvasTileLayerRenderer {
       ? frameState.declutter?.[declutter]?.all().map((item) => item.value)
       : null;
     let found;
-    foundFeature: for (let i = 0, ii = renderedTiles.length; i < ii; ++i) {
+    foundFeature: for (let i = renderedTiles.length - 1; i >= 0; --i) {
       const tile = renderedTiles[i];
       const tileExtent = tileGrid.getTileCoordExtent(tile.wrappedTileCoord);
       if (!intersects(tileExtent, hitExtent)) {
@@ -960,7 +961,7 @@ class CanvasVectorTileLayerRenderer extends CanvasTileLayerRenderer {
 
   /**
    * @param {import("../../VectorRenderTile.js").default} tile Tile.
-   * @param {import("../../Map").FrameState} frameState Frame state.
+   * @param {import("../../Map.js").FrameState} frameState Frame state.
    * @private
    */
   renderTileImage_(tile, frameState) {

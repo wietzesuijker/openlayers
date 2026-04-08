@@ -4,16 +4,19 @@
 import DataTile from '../DataTile.js';
 import TileState from '../TileState.js';
 import EventType from '../events/EventType.js';
+import {getHeight, getWidth} from '../extent.js';
 import {toPromise} from '../functions.js';
 import {equivalent, get as getProjection} from '../proj.js';
 import ReprojDataTile from '../reproj/DataTile.js';
 import {toSize} from '../size.js';
 import {getCacheKey} from '../tilecoord.js';
 import {
+  createForProjection,
   createXYZ,
   extentFromProjection,
   getForProjection as getTileGridForProjection,
 } from '../tilegrid.js';
+import {DEFAULT_TILE_SIZE} from '../tilegrid/common.js';
 import {getUid} from '../util.js';
 import TileSource, {TileSourceEvent} from './Tile.js';
 import TileEventType from './TileEventType.js';
@@ -150,7 +153,8 @@ class DataTileSource extends TileSource {
     this.bandCount = options.bandCount === undefined ? 4 : options.bandCount; // assume RGBA if undefined
 
     /**
-     * @type {number|undefined} The 1-based band index for the nodata alpha band.
+     * The 1-based band index for the nodata alpha band.
+     * @type {number|undefined}
      */
     this.nodataBandIndex;
 
@@ -417,8 +421,34 @@ class DataTileSource extends TileSource {
 
     const projKey = getUid(projection);
     if (!(projKey in this.tileGridForProjection_)) {
-      this.tileGridForProjection_[projKey] =
-        getTileGridForProjection(projection);
+      if (this.tileGrid && thisProj && !equivalent(thisProj, projection)) {
+        // Limit the target tile grid's zoom levels based on the source's
+        // finest available resolution to avoid creating excessive target
+        // tiles that all map to the same source data.
+        const sourceResolutions = this.tileGrid.getResolutions();
+        const sourceFinestRes = sourceResolutions[sourceResolutions.length - 1];
+        const sourceMetersPerUnit = thisProj.getMetersPerUnit() || 1;
+        const targetMetersPerUnit = projection.getMetersPerUnit() || 1;
+        const targetFinestRes =
+          (sourceFinestRes * sourceMetersPerUnit) / targetMetersPerUnit;
+        const extent = extentFromProjection(projection);
+        const tileSize = DEFAULT_TILE_SIZE;
+        const maxResolution = Math.max(
+          getWidth(extent) / tileSize,
+          getHeight(extent) / tileSize,
+        );
+        const maxZoom = Math.max(
+          0,
+          Math.ceil(Math.log2(maxResolution / targetFinestRes)) + 1,
+        );
+        this.tileGridForProjection_[projKey] = createForProjection(
+          projection,
+          maxZoom,
+        );
+      } else {
+        this.tileGridForProjection_[projKey] =
+          getTileGridForProjection(projection);
+      }
     }
     return this.tileGridForProjection_[projKey];
   }

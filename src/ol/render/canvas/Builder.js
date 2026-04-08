@@ -3,13 +3,13 @@
  */
 import {equals, reverseSubArray} from '../../array.js';
 import {asColorLike} from '../../colorlike.js';
-import Relationship from '../../extent/Relationship.js';
 import {
   buffer,
   clone,
   containsCoordinate,
   coordinateRelationship,
 } from '../../extent.js';
+import Relationship from '../../extent/Relationship.js';
 import {
   inflateCoordinates,
   inflateCoordinatesArray,
@@ -426,7 +426,7 @@ class CanvasBuilder extends VectorContext {
 
   /**
    * @protected
-   * @param {import("../../geom/Geometry").default|import("../Feature.js").default} geometry The geometry.
+   * @param {import("../../geom/Geometry.js").default|import("../Feature.js").default} geometry The geometry.
    * @param {import("../../Feature.js").FeatureLike} feature Feature.
    * @param {number} index Render order index
    */
@@ -503,9 +503,9 @@ class CanvasBuilder extends VectorContext {
         'src' in fillStyleColor
           ? this.pixelRatio
           : 1;
-      state.fillStyle = asColorLike(
-        fillStyleColor ? fillStyleColor : defaultFillStyle,
-      );
+      state.fillStyle =
+        asColorLike(fillStyleColor ? fillStyleColor : defaultFillStyle) ??
+        undefined;
     } else {
       state.fillStyle = undefined;
     }
